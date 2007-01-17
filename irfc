@@ -1,0 +1,504 @@
+#!/usr/bin/perl
+
+###############################################################################
+# Configuration                                                               #
+###############################################################################
+
+# The directory structure to read (hint: use symlinks to build a structure
+# you like)
+$MENUDIR="/home/mm/menu";
+
+# Give the full pathnames to your CD-Drive mount points - They have to be inside
+# your menustructure and have to exist in /etc/fstab as user mountable
+$CDDRIVE[0]="/home/mm/menu/CD";
+#$CDDRIVE[1]="/home/mm/menu/CD2";
+
+# Assign filetypes to commands here. The actual choosen filename is either
+# appended to the command or if a §f placeholder exists inserted there.
+%FILETYPES=( avi  => "mplayer §f; Xvidmode 800 600",
+             mpeg => "mplayer §f; Xvidmode 800 600",
+             mpg  => "mplayer §f; Xvidmode 800 600",
+             ram  => "realplay",
+             rm   => "realplay",
+             m3u  => "xmms",
+             mp3  => "xmms",
+             pls  => "xmms",
+             sh   => "bash",
+             pl   => "perl",
+             smc  => "snes9x -fs -mono -y -joymap1 0 1 3 2 4 5 8 9 -joymap2 0 1 3 2 4 5 8 9 §f; Xvidmode 800 600",
+             sfc  => "snes9x -fs -mono -y -joymap1 0 1 3 2 4 5 8 9 -joymap2 0 1 3 2 4 5 8 9 §f; Xvidmode 800 600",
+             fig  => "snes9x -fs -mono -y -joymap1 0 1 3 2 4 5 8 9 -joymap2 0 1 3 2 4 5 8 9 §f; Xvidmode 800 600",
+             smd  => "dgen -P -j -f §f; Xvidmode 800 600");
+
+# Assign your remote control buttons to the commands used by irfc
+# you can assign multiple buttons to the same command. The following special
+# comands are recognized by irfc: [down], [up], [enter], [fast_up], [fast_down]
+# anny other command is sent to the shell this way you can for example assign
+# some quicklinks to the number buttons
+%BUTTONS=( Down => "[down]",
+           Up   => "[up]",
+           Okay => "[enter]",
+           Left => "[back]",
+           "+"  => "[fast_up]",
+           "-"  => "[fast_down]",
+           "1"  => "xmms /ftp/mp3z/music/playlist.m3u");
+
+# This value is for finetuning the remotecontrol only every $DROPREPEATS signal
+# is used for doing something.
+$DROPREPEATS=3;
+
+# The Size of the menuwindow (x,y)
+@WINDOWSIZE=(800,600);
+
+# Listfont use xfontsel to get the name you want to use
+$FONT='-*-*-*-r-*-*-*-180-*-*-*-*-*';
+#$FONT='-urw-bookman-demibold-r-normal-*-*-180-*-*-p-*-iso8859-2';
+
+# Should we use polling? (uses 100% CPU)
+# Otherwise, use events: much nicer on the machine
+$USE_POLL=0;
+
+# Show file extension on the list?
+$SHOW_EXT=0;
+
+###############################################################################
+# No changes below                                                            #
+###############################################################################
+
+# apt-get install libgtk-perl
+use Gtk;
+# apt-get install libtime-hires-perl
+# perl -MCPAN -e shell
+#  install Event
+#  install RCU
+use RCU;
+use RCU::Context;
+use RCU::Event;
+
+###############################################################################
+# License                                                                     #
+###############################################################################
+
+print STDERR <<end;
+ /----------------------------------------------------------------\\
+ | irfc - IR File Chooser                                         |
+ | Copyright (C) 2001 Andreas Gohr <a.gohr\@web.de>                |
+ |                                                                |
+ | This program is free software; you can redistribute it and/or  |
+ | modify it under the terms of the GNU General Public License as |
+ | published by the Free Software Foundation; either version 2 of |
+ | the License, or (at your option) any later version.            |
+ |                                                                |
+ | See COPYING for details                                        |
+ \\----------------------------------------------------------------/
+end
+
+# Changes by Kees Cook <kees@outflux.net>
+# - Event-based lirc (to not take 100% CPU)
+# - Added "Back" command to move up in the directory tree
+# - Small GTK clean-ups to reduce the size of unused space in the status window
+# - Cleaned up GTK clist
+# - Added file extension visibility
+
+# Forcibly disable the screen saver
+system("xset s off");
+
+###############################################################################
+# Init                                                                        #
+###############################################################################
+
+$false=0;
+$true=1;
+
+init Gtk;
+setupInput();  # Start listening for IR commands
+
+###############################################################################
+# Set up GUI                                                                  #
+###############################################################################
+
+# Fontselection (Thanks to "Da Kourier" <dakourier@armitage.gotdns.com>)
+my $_style = new Gtk::Style;
+$_style->font( Gtk::Gdk::Font->load($FONT));
+
+# Info window size
+$INFO_SIZE = 110;	# FIXME: this should be set based on the font size
+$TIME_UPDATE=100;	# check the time every 1/10th of a second
+
+#Set up mainwindow
+$_mainwindow = new Gtk::Window( "toplevel" );
+$_mainwindow->set_title("IR File Chooser");
+$_mainwindow->set_position("center");
+$_mainwindow->set_default_size($WINDOWSIZE[0],$WINDOWSIZE[1]);
+$_mainwindow->signal_connect("delete_event",\&CloseAppWindow);
+
+#Set up layoutmanager
+$_vbox = new Gtk::VBox( $false, 5 );
+$_vbox->set_border_width( 5 );
+$_mainwindow->add( $_vbox );
+$_vbox->show();
+
+# This is the scrolled window to put the List widget inside
+$_scrollbox = new Gtk::ScrolledWindow( undef, undef );
+#let the size come from other widgets
+#$_scrollbox->set_usize( $WINDOWSIZE[0], $WINDOWSIZE[1]-$INFO_SIZE );
+$_scrollbox->set_usize( -2, $WINDOWSIZE[1]-$INFO_SIZE );
+# auto scroll bars
+$_scrollbox->set_policy( 1, 1 );
+$_vbox->add( $_scrollbox );
+$_scrollbox->show();
+
+$USE_FRAME=1; # use a frame
+$USE_TEXT=0;  # don't use a text widget
+
+if ($USE_FRAME)
+{
+  # The Info area
+  $_infobox = new Gtk::Frame( );
+  $_infobox->border_width( 0 );
+  #let the size come from other widgets
+  #$_infobox->set_usize( $WINDOWSIZE[0], $INFO_SIZE );
+  $_vbox->add( $_infobox );
+  $_infobox->show();
+  #Infolabel
+  $_infolabel = new Gtk::Label("WELCOME");
+  $_infolabel->set_name( "welcome" );
+  $_infolabel->set_justify("center");
+  $_infolabel->set_line_wrap($false);
+  $_infobox->add( $_infolabel );
+  $_infolabel->show();
+}
+else
+{
+  if ($USE_TEXT)
+  {
+    $_infolabel = new Gtk::Text();
+    $_infolabel->set_editable($false);
+    $_infolabel->set_name( "welcome" );
+    $_infolabel->insert(undef,undef,undef,"WELCOME");
+  }
+  else
+  {
+    $_infolabel = new Gtk::Label("WELCOME");
+    $_infolabel->set_name( "welcome" );
+    $_infolabel->set_justify("left");
+    $_infolabel->set_line_wrap($true);
+  }
+  $_vbox->add( $_infolabel );
+  $_infolabel->show();
+}
+
+$_list = new Gtk::CList(2);
+$_list->set_style($_style);
+$_list->set_selection_mode("browse");
+$_list->column_titles_hide();
+$_list->set_column_visibility(1,$false);
+$_list->set_auto_sort($true);
+$_list->set_name( "dirlist" );
+$_list->signal_connect("key_press_event",\&ListOnKeyPress);
+$_scrollbox->add($_list);
+$_list->show();
+
+startTimeStatus();
+
+&buildList($MENUDIR);
+
+$_mainwindow->show();
+main Gtk;
+
+
+###############################################################################
+# Subfunctions                                                                #
+###############################################################################
+
+sub buildList($){
+  my $path = $_[0];
+  my ($file, $label, $ok, $ext);
+
+  $_list->freeze();
+  while ($_list->rows())
+  {
+    $_list->remove(0);
+  }
+  $_list->thaw();
+
+  # show screen being updated?  This doesn't seem to be working...
+  #Gtk->main_iteration() while (Gtk->events_pending());
+  #while (Gtk->events_pending()) { Gtk->main_iteration(); }
+  Gtk::Gdk->flush();
+  #while (Gtk->main_iteration_do($false)) { ; }
+
+  $_list->freeze();
+  opendir(ROOT, $path);
+  my @files = readdir(ROOT);
+  closedir(ROOT);
+
+  foreach $file (@files) {
+    next if ( ($file =~ m/^\./) and ($file !~ m/^\.\.$/) );
+    next if (($path eq $MENUDIR) and ($file =~ m/^\.\.$/));
+
+    $fullFilename    = "$path/$file";
+
+    if (-d $fullFilename){
+      $label = " [$file]";
+    }else{
+      $ext = &checkExt($file);
+      if (-z $fullFilename){
+        next; #skip empty files
+      }elsif (defined($ext)){
+        $label = $file;
+        $label =~ s/\.$ext$//i;
+	$label = "$label ($ext)" if ($SHOW_EXT);
+      }else{
+        next;
+      }
+    }
+    $label =~ s/_/ /g;
+    $_list->append($label, $fullFilename);
+  }
+
+  $_list->select_row(0,0);  
+  $_list->thaw();
+  $_list->grab_focus();
+}
+
+sub CloseAppWindow{
+  Gtk->exit(0);
+  return $false;
+}
+
+sub ListOnKeyPress{
+  my ($widget, @data) = @_;
+  my $event = pop(@data);
+
+  if ($event->{'keyval'} == 65293){
+    onEnter();
+  }
+}
+
+# Go up one directory
+sub onBack(){
+  my $file = $_list->get_text(0,1);
+
+  $file = substr($file, 0, rindex($file,'/'));
+
+  # don't go up past top
+  return if ($file eq $MENUDIR);
+
+  $file = substr($file, 0, rindex($file,'/'));
+  &buildList($file);
+}
+
+sub stopTimeStatus(){
+  # pause timer
+  Gtk->timeout_remove($_timer);
+}
+
+sub startTimeStatus(){
+  # put timer back
+  displayDateTime();
+  $_timer = Gtk->timeout_add($TIME_UPDATE, \&displayDateTime);
+}
+
+sub setupInput(){
+  if ($USE_POLL==1) {
+    $_rcu = new RCU "RCU:Lirc:irfc";
+  }
+  else {
+    $_rcu_context = new RCU::Context;
+    $_rcu_context->bind("=.*",
+	  sub {
+		  my ($history,$time,$rcu)=@_;
+		  $history=~/=(.*)/;
+		  my $key=$1;
+		  gotEvent($key);
+	  }
+    );
+    $_rcu_ignore_context = new RCU::Context;
+    $_rcu_ignore_context->bind("=.*",
+	  sub {
+		  my ($history,$time,$rcu)=@_;
+		  $history=~/=(.*)/;
+		  my $key=$1;
+	  }
+    );
+    $_rcu_event = new RCU::Event "RCU:Lirc:irfc";
+    $_rcu_event->set_context($_rcu_context);
+  }
+  $_idle = Gtk->idle_add(\&idle);
+}
+
+sub ignoreInput(){
+  # stop listening for commands
+  if ($USE_POLL==1) {
+    Gtk->idle_remove($_idle);
+  }
+  else {
+    $_rcu_event->set_context($_rcu_ignore_context);
+  }
+
+}
+
+sub takeInput(){
+  # listen for commands
+  if ($USE_POLL==1) {
+    $_idle = Gtk->idle_add(\&idle);
+  }
+  else {
+    # flush any pending RCU events
+    while ( Event::one_event(0.1) == 1)
+    {
+	# print "skipping event\n";
+    }
+    # start listening again
+    $_rcu_event->set_context($_rcu_context);
+  }
+
+}
+
+sub onEnter(){
+  my $index = $_list->selection();
+  my $file = $_list->get_text($index,1);
+
+  stopTimeStatus();
+  ignoreInput();
+
+  # this doesn't work for some reason
+  updateStatus("- WAIT -");
+
+  if (-d $file){
+    #check if it is a mountpoint:
+    foreach $drive (@CDDRIVE){
+      system("umount $drive") if ($file =~ m/$drive\/\.\.$/);
+      system("mount $drive") if ($file =~ m/$drive$/);
+    }
+    #change directory
+    if ($file =~ m/\/\.\.$/){
+      $file = substr($file, 0, rindex($file,'/'));
+      $file = substr($file, 0, rindex($file,'/'));
+    }
+    &buildList($file);
+  }else{
+    #run file
+    my $ext = &checkExt($file);
+    $file = quotemeta($file);
+    my $command = $FILETYPES{$ext};
+    if ($command =~ m/§f/){
+      $command =~ s/§f/$file/g;
+    }else{
+      $command = $command." ".$file;
+    }
+    &execute($command);
+  }
+
+  takeInput();
+  startTimeStatus();
+}
+
+sub execute($){
+  my $command = $_[0];
+  $_mainwindow->hide();
+  Gtk->main_iteration() while (Gtk->events_pending());
+  system($command);
+  $_mainwindow->show();
+}
+
+# Update the status window only on a change
+$PREV_STATUS="";
+sub updateStatus{
+  my ($status)=@_;
+  if ($PREV_STATUS ne $status)
+  {
+    if ($USE_TEXT)
+    {
+      $_infolabel->freeze();
+      $_infolabel->set_point(0);
+      $_infolabel->forward_delete($_infolabel->get_length());
+      $_infolabel->insert(undef,undef,undef,$status);
+      $_infolabel->thaw();
+    }
+    else
+    {
+      $_infolabel->set_text($status);
+    }
+    $PREV_STATUS=$status;
+  }
+}
+
+sub displayDateTime{
+  my $t;
+  chomp($t = localtime(time()));
+  updateStatus($t);
+  
+  return $true;
+}
+
+sub checkExt($){
+  my $file = $_[0];
+  my $ext;
+  foreach $ext (keys(%FILETYPES)){
+    if ($file =~ m/\.$ext$/i){
+      return $ext;
+    }
+  }
+  return undef;
+}
+
+sub moveinlist($){
+  my $add = $_[0];
+  my ($index,$i);
+
+  if($add >0){
+    for ($i=0; $i<$add; $i++){
+      $index = ($_list->selection())+1;
+      $_list->select_row( $index, 0 );
+      $_list->moveto($index,0,1.0,0.0) if ($_list->row_is_visible($index) ne 'full');
+    }
+  }else{
+    for ($i=$add; $i<0; $i++){
+      $index = ($_list->selection())-1;
+      $_list->select_row( $index, 0 );
+      $_list->moveto($index,0,0.0,0.0) if ($_list->row_is_visible($index) ne 'full');
+    }
+  }
+}
+
+sub gotEvent{
+  my ($key,$repeat) = @_;
+  my $cmd = $BUTTONS{$key} if (defined($key));
+  if ( defined($cmd) and !($repeat % $DROPREPEATS) ){
+    #check buttons
+    if ($cmd eq "[up]"){
+      &moveinlist(-1);
+    }elsif ($cmd eq "[down]"){
+      &moveinlist(+1);
+    }elsif ($cmd eq "[fast_up]"){
+      &moveinlist(-5);
+    }elsif ($cmd eq "[fast_down]"){
+      &moveinlist(+5);
+    }elsif ($cmd eq "[back]"){
+      &onBack();
+    }elsif ($cmd eq "[enter]"){
+      &onEnter();
+    }else{
+      stopTimeStatus();
+      ignoreInput();
+      #execute quicklink
+      &execute($cmd);
+      takeInput();
+      startTimeStatus();
+    }
+  }
+  return $true;
+}
+  
+sub idle{
+  if ($USE_POLL==1) {
+    my ($key, $repeat) = $_rcu->poll;
+    return gotEvent($key,$repeat);
+  } else {
+    # grab any pending keypresses
+    Event::one_event(0.2);
+    return $true;
+  }
+}
