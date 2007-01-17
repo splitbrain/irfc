@@ -310,8 +310,20 @@ sub setupInput(){
 	  sub {
 		  my ($history,$time,$rcu)=@_;
 		  $history=~/=(.*)/;
+                  
+                  # check for repeating keys
+                  if($last_key eq $1) {
+                    $repeat_count++;
+                  }else{
+                    $repeat_count=0;
+                  }
+                  $last_key=$1;
+                  
 		  my $key=$1;
-		  gotEvent($key);
+                  
+                  if( !($repeat_count % $DROPREPEATS)) {
+		    gotEvent($key);
+                  }
 	  }
     );
     $_rcu_ignore_context = new RCU::Context;
